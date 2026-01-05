@@ -1,0 +1,13 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-dotenv==1.0.1
+
+# GenAI + RAG stack (we'll use these soon)
+openai==1.59.6
+langgraph==0.2.60
+langchain-core==0.3.28
+qdrant-client==1.12.1
+pypdf==5.1.0
+tiktoken==0.8.0
+

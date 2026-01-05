@@ -1,0 +1,23 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# Node
+node_modules/
+dist/
+build/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Data / qdrant
+qdrant_storage/
+EOF
