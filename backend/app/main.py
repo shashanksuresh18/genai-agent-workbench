@@ -2,23 +2,57 @@ import os
 import sys
 import json
 import time
+import logging
 from uuid import uuid4
+from pathlib import Path
 from typing import Any, Optional, TypedDict, List, Dict
 
-from fastapi import FastAPI, Header, HTTPException, Request
+# Load backend/.env for local dev (safe: doesn't override real env vars)
+from dotenv import load_dotenv
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"  # backend/.env
+if ENV_PATH.exists():
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
+
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from app.rag.store import ensure_collection
 from app.rag.ingest import ingest_text, search as rag_search
+from app.auth import auth_dep, auth_dep_metrics, AuthContext, AUTH_MODE
 
-# Azure OpenAI (OpenAI python SDK v1.x)
 from openai import AzureOpenAI
 from openai import APIConnectionError, APITimeoutError, RateLimitError, APIStatusError
 
-# LangGraph
 from langgraph.graph import StateGraph, END
+
+
+# ----------------------------
+# Metrics
+# ----------------------------
+HTTP_REQUESTS_TOTAL = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["auth_type", "method", "path", "status"],
+)
+
+HTTP_REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"],
+)
+
+RAG_SEARCH_DURATION = Histogram(
+    "rag_search_duration_seconds",
+    "RAG search duration in seconds",
+    ["op"],
+)
+
+AOAI_CALLS_TOTAL = Counter("aoai_calls_total", "Azure OpenAI calls total")
+AOAI_RETRIES_TOTAL = Counter("aoai_retries_total", "Azure OpenAI retries total")
 
 
 # ----------------------------
@@ -26,7 +60,7 @@ from langgraph.graph import StateGraph, END
 # ----------------------------
 class RunRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
-    mode: str = Field(default="rag")  # rag | chat (same for now)
+    mode: str = Field(default="rag")
     top_k: int = Field(default=5, ge=1, le=20)
     doc_id: Optional[str] = None
 
@@ -80,15 +114,22 @@ class ErrorResponse(BaseModel):
 # ----------------------------
 # App + config
 # ----------------------------
-app = FastAPI(title="genai-agent-workbench", version="0.2.0")
+app = FastAPI(title="genai-agent-workbench", version="0.3.0")
 
-GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "").strip()
-MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() in {"1", "true", "yes", "y"}
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, stream=sys.stdout, format="%(message)s")
+logger = logging.getLogger("workbench")
+
+MOCK_LLM = os.getenv("MOCK_LLM", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+
+AOAI_TIMEOUT_SECONDS = float(os.getenv("AOAI_TIMEOUT_SECONDS", "20"))
+AOAI_MAX_RETRIES = int(os.getenv("AOAI_MAX_RETRIES", "2"))
+AOAI_RETRY_BASE_MS = int(os.getenv("AOAI_RETRY_BASE_MS", "250"))
 
 
 def _get_aoai_client() -> AzureOpenAI:
@@ -109,7 +150,7 @@ def _get_aoai_client() -> AzureOpenAI:
 
 
 # ----------------------------
-# Request tracing
+# Request + logs + metrics middleware
 # ----------------------------
 def _get_request_id(request: Request) -> str:
     rid = getattr(request.state, "request_id", None)
@@ -121,12 +162,53 @@ def _get_request_id(request: Request) -> str:
 
 
 @app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
+async def observability_middleware(request: Request, call_next):
     rid = request.headers.get("x-request-id") or str(uuid4())
     request.state.request_id = rid
-    response = await call_next(request)
-    response.headers["x-request-id"] = rid
-    return response
+
+    start = time.perf_counter()
+    status_code = 500
+    response = None
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+
+        # attach headers on success responses
+        response.headers["x-request-id"] = rid
+        response.headers["x-auth-mode"] = AUTH_MODE
+        return response
+
+    except Exception:
+        status_code = 500
+        raise
+
+    finally:
+        dur_s = max(0.0, time.perf_counter() - start)
+        auth_type = getattr(request.state, "auth_type", None) or "none"
+
+        HTTP_REQUESTS_TOTAL.labels(
+            auth_type=auth_type,
+            method=request.method,
+            path=request.url.path,
+            status=str(status_code),
+        ).inc()
+
+        HTTP_REQUEST_DURATION.labels(
+            method=request.method,
+            path=request.url.path,
+        ).observe(dur_s)
+
+        event = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "request_id": rid,
+            "method": request.method,
+            "path": request.url.path,
+            "status": status_code,
+            "duration_ms": int(dur_s * 1000),
+            "auth_type": auth_type,
+        }
+        logger.info(json.dumps(event, separators=(",", ":")))
 
 
 # ----------------------------
@@ -140,6 +222,7 @@ def _error_json(request: Request, status: int, code: str, message: str, details:
     ).model_dump()
     resp = JSONResponse(status_code=status, content=payload)
     resp.headers["x-request-id"] = rid
+    resp.headers["x-auth-mode"] = AUTH_MODE
     return resp
 
 
@@ -153,6 +236,8 @@ async def http_handler(request: Request, exc: HTTPException):
     code = "HTTP_ERROR"
     if exc.status_code == 401:
         code = "UNAUTHORIZED"
+    elif exc.status_code == 403:
+        code = "FORBIDDEN"
     elif 400 <= exc.status_code < 500:
         code = "BAD_REQUEST"
     elif exc.status_code >= 500:
@@ -167,23 +252,14 @@ async def unhandled_handler(request: Request, exc: Exception):
 
 
 # ----------------------------
-# Auth
-# ----------------------------
-def _require_key(x_api_key: Optional[str]):
-    if not GATEWAY_API_KEY:
-        raise HTTPException(status_code=500, detail="Server misconfigured: missing GATEWAY_API_KEY.")
-    if not x_api_key or x_api_key != GATEWAY_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid x-api-key.")
-
-
-# ----------------------------
 # Startup
 # ----------------------------
 @app.on_event("startup")
 def startup():
     try:
         ensure_collection()
-        print("[startup] Qdrant collection ensured.", file=sys.stderr)
+        print(f"[startup] Qdrant collection ensured. ENV={ENV_PATH}", file=sys.stderr)
+        print(f"[startup] AUTH_MODE={AUTH_MODE} MOCK_LLM={MOCK_LLM}", file=sys.stderr)
     except Exception as e:
         print(f"[startup] Qdrant init FAILED: {type(e).__name__}: {e}", file=sys.stderr)
 
@@ -201,19 +277,62 @@ class AgentState(TypedDict, total=False):
 
 
 def _node_retrieve(state: AgentState) -> AgentState:
-    hits = rag_search(
-        query=state["question"],
-        top_k=int(state.get("top_k", 5)),
-        doc_id=state.get("doc_id"),
-    )
+    with RAG_SEARCH_DURATION.labels(op="search").time():
+        hits = rag_search(
+            query=state["question"],
+            top_k=int(state.get("top_k", 5)),
+            doc_id=state.get("doc_id"),
+        )
     return {"hits": hits}
+
+
+def _aoai_chat_json(system: str, user: str) -> str:
+    client = _get_aoai_client()
+
+    for attempt in range(AOAI_MAX_RETRIES + 1):
+        if attempt > 0:
+            AOAI_RETRIES_TOTAL.inc()
+
+        try:
+            AOAI_CALLS_TOTAL.inc()
+            resp = client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+                timeout=AOAI_TIMEOUT_SECONDS,
+            )
+            return (resp.choices[0].message.content or "").strip()
+
+        except RateLimitError:
+            if attempt >= AOAI_MAX_RETRIES:
+                raise HTTPException(status_code=503, detail="Upstream LLM is rate limiting. Try again.")
+        except APITimeoutError:
+            if attempt >= AOAI_MAX_RETRIES:
+                raise HTTPException(status_code=504, detail="Upstream LLM timed out.")
+        except APIConnectionError:
+            if attempt >= AOAI_MAX_RETRIES:
+                raise HTTPException(status_code=503, detail="Upstream LLM connection failed.")
+        except APIStatusError:
+            if attempt >= AOAI_MAX_RETRIES:
+                raise HTTPException(status_code=502, detail="Upstream LLM returned an error.")
+        except Exception:
+            if attempt >= AOAI_MAX_RETRIES:
+                raise HTTPException(status_code=502, detail="Upstream LLM request failed.")
+
+        sleep_s = (AOAI_RETRY_BASE_MS * (2 ** attempt)) / 1000.0
+        time.sleep(sleep_s)
+
+    raise HTTPException(status_code=502, detail="Upstream LLM request failed.")
 
 
 def _node_generate(state: AgentState) -> AgentState:
     hits = state.get("hits", [])
-    # Build a compact context block (don’t flood tokens)
     ctx_lines = []
     citations = []
+
     for h in hits[:8]:
         did = h.get("doc_id")
         cid = h.get("chunk_id")
@@ -223,11 +342,11 @@ def _node_generate(state: AgentState) -> AgentState:
         if did is not None and cid is not None:
             citations.append({"doc_id": str(did), "chunk_id": int(cid), "source": src})
 
+    ctx_text = "\n".join(ctx_lines[:8])
+
     if MOCK_LLM:
         ans = f"(mock) Based on retrieved context: {ctx_lines[0] if ctx_lines else 'no context'}"
         return {"answer": ans, "citations": citations}
-
-    client = _get_aoai_client()
 
     system = (
         "You are a banking-grade assistant. Use ONLY the provided context to answer.\n"
@@ -235,55 +354,32 @@ def _node_generate(state: AgentState) -> AgentState:
         "If context is insufficient, say so in the answer and return an empty citations list.\n"
         "No markdown. JSON only."
     )
+    user = f"QUESTION: {state['question']}\n\nCONTEXT:\n{ctx_text}"
 
-    user = (
-        f"QUESTION: {state['question']}\n\n"
-        f"CONTEXT:\n" + "\n".join(ctx_lines[:8])
-    )
+    raw = _aoai_chat_json(system=system, user=user)
 
     try:
-        resp = client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
+        obj = json.loads(raw)
+        ans = str(obj.get("answer", "")).strip()
+        cits = obj.get("citations", [])
+        if not isinstance(cits, list):
+            cits = []
 
-        # Parse JSON response; if model misbehaves, fallback safely.
-        try:
-            obj = json.loads(raw)
-            ans = str(obj.get("answer", "")).strip()
-            cits = obj.get("citations", [])
-            if not isinstance(cits, list):
-                cits = []
-            # sanitize citations shape
-            cleaned = []
-            for c in cits:
-                if not isinstance(c, dict):
-                    continue
-                did = c.get("doc_id")
-                cid = c.get("chunk_id")
-                if did is None or cid is None:
-                    continue
-                cleaned.append({"doc_id": str(did), "chunk_id": int(cid), "source": None})
-            return {"answer": ans, "citations": cleaned}
-        except Exception:
-            # fallback: answer raw, citations from retrieved hits
-            return {"answer": raw, "citations": citations}
+        cleaned = []
+        for c in cits:
+            if not isinstance(c, dict):
+                continue
+            did = c.get("doc_id")
+            cid = c.get("chunk_id")
+            if did is None or cid is None:
+                continue
+            cleaned.append({"doc_id": str(did), "chunk_id": int(cid), "source": None})
 
-    except RateLimitError:
-        raise HTTPException(status_code=503, detail="Upstream LLM is rate limiting. Try again.")
-    except APITimeoutError:
-        raise HTTPException(status_code=504, detail="Upstream LLM timed out.")
-    except APIConnectionError:
-        raise HTTPException(status_code=503, detail="Upstream LLM connection failed.")
-    except APIStatusError:
-        raise HTTPException(status_code=502, detail="Upstream LLM returned an error.")
+        return {"answer": ans, "citations": cleaned}
+
     except Exception:
-        raise HTTPException(status_code=502, detail="Upstream LLM request failed.")
+        # fallback: raw model text + retrieved citations
+        return {"answer": raw, "citations": citations}
 
 
 _graph = StateGraph(AgentState)
@@ -303,9 +399,24 @@ def healthz():
     return {"ok": True}
 
 
+@app.get("/metrics")
+def metrics(_: AuthContext = Depends(auth_dep_metrics)):
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/whoami")
+def whoami(request: Request, auth: AuthContext = Depends(auth_dep)):
+    return {
+        "request_id": _get_request_id(request),
+        "auth_type": auth.auth_type,
+        "oid": auth.oid,
+        "tid": auth.tid,
+        "upn": auth.upn,
+    }
+
+
 @app.post("/api/upload")
-def upload(req: UploadRequest, request: Request, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")):
-    _require_key(x_api_key)
+def upload(req: UploadRequest, request: Request, _: AuthContext = Depends(auth_dep)):
     result = ingest_text(
         text=req.text,
         source=req.source,
@@ -317,31 +428,46 @@ def upload(req: UploadRequest, request: Request, x_api_key: Optional[str] = Head
 
 
 @app.post("/api/search")
-def search(req: SearchRequest, request: Request, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")):
-    _require_key(x_api_key)
+def search(req: SearchRequest, request: Request, _: AuthContext = Depends(auth_dep)):
     hits = rag_search(query=req.query, top_k=req.top_k, doc_id=req.doc_id)
     return {"request_id": _get_request_id(request), "hits": hits}
 
 
 @app.post("/api/run", response_model=RunResponse)
-def run(req: RunRequest, request: Request, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")):
-    _require_key(x_api_key)
+def run(req: RunRequest, request: Request, auth: AuthContext = Depends(auth_dep)):
     rid = _get_request_id(request)
-
     steps: list[StepTrace] = []
 
     t0 = time.perf_counter()
     state: AgentState = {"question": req.message, "top_k": req.top_k, "doc_id": req.doc_id}
-    # retrieve
+
     out1 = _node_retrieve(state)
     state.update(out1)
-    steps.append(StepTrace(name="retrieve", ms=int((time.perf_counter() - t0) * 1000), meta={"hits": len(state.get("hits", []))}))
+    steps.append(
+        StepTrace(
+            name="retrieve",
+            ms=int((time.perf_counter() - t0) * 1000),
+            meta={"hits": len(state.get("hits", []))},
+        )
+    )
 
-    # generate (LLM)
     t1 = time.perf_counter()
     out2 = _node_generate(state)
     state.update(out2)
-    steps.append(StepTrace(name="generate", ms=int((time.perf_counter() - t1) * 1000), meta={"mock": MOCK_LLM}))
+    steps.append(
+        StepTrace(
+            name="generate",
+            ms=int((time.perf_counter() - t1) * 1000),
+            meta={
+                "mock": MOCK_LLM,
+                "auth_type": auth.auth_type,
+                "timeout_s": AOAI_TIMEOUT_SECONDS,
+                "max_retries": AOAI_MAX_RETRIES,
+                "ctx_chars": sum(len((h.get("text") or "")) for h in (state.get("hits") or [])[:8]),
+                "ctx_chunks": min(len(state.get("hits") or []), 8),
+            },
+        )
+    )
 
     cits = state.get("citations", []) or []
     citations = [Citation(**c) for c in cits if isinstance(c, dict)]
